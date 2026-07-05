@@ -17,6 +17,7 @@ EASTING_ALIASES = ["easting", "east", "e", "x", "grid e", "grid east"]
 NORTHING_ALIASES = ["northing", "north", "n", "y", "grid n", "grid north"]
 HEIGHT_ALIASES = ["height", "elevation", "elev", "z", "rl", "level", "orthometric height"]
 SOLUTION_ALIASES = ["solution", "fix status", "fix", "status", "quality", "gnss solution"]
+DATE_ALIASES = ["date", "survey date", "observed date", "observation date", "time", "timestamp", "datetime"]
 
 OUTPUT_COLUMNS = [
     "Point Name",
@@ -101,6 +102,17 @@ def detect_columns(df: pd.DataFrame) -> tuple[dict[str, str | None], list[str]]:
     return detected, missing
 
 
+def detect_date_column(df: pd.DataFrame) -> str | None:
+    normalized = {normalize_header(column): column for column in df.columns}
+    for option in DATE_ALIASES:
+        if option in normalized:
+            return normalized[option]
+    for header, original in normalized.items():
+        if any(option in header for option in DATE_ALIASES):
+            return original
+    return None
+
+
 def load_fieldbook(uploaded_file: Any) -> pd.DataFrame:
     name = getattr(uploaded_file, "name", "").lower()
     if name.endswith((".xlsx", ".xlsm", ".xls")):
@@ -144,9 +156,12 @@ def analyze_fieldbook(
     position_tolerance_mm: float = 100.0,
     height_tolerance_mm: float = 20.0,
     invert_for_autocad: bool = False,
+    latest_date_column: str | None = None,
+    position_only: bool = False,
 ) -> dict[str, pd.DataFrame]:
     classified = classify_rows(df, columns)
     errors: list[dict[str, Any]] = []
+    latest_survey_date = None
 
     for source, target in [
         (columns.easting, "_EastingNum"),
@@ -183,7 +198,33 @@ def analyze_fieldbook(
             )
 
     controls = classified[classified["_Class"] == "CONTROL"].copy()
-    measured = classified[classified["_Class"] == "MEASURED"].copy()
+    measured_all = classified[classified["_Class"] == "MEASURED"].copy()
+
+    if latest_date_column:
+        classified["_SurveyDate"] = pd.to_datetime(
+            classified[latest_date_column], errors="coerce"
+        ).dt.date
+        measured_dates = classified.loc[classified["_Class"] == "MEASURED", "_SurveyDate"].dropna()
+        if not measured_dates.empty:
+            latest_survey_date = measured_dates.max()
+            measured = measured_all[
+                pd.to_datetime(measured_all[latest_date_column], errors="coerce").dt.date
+                == latest_survey_date
+            ].copy()
+            old_measured_indexes = measured_all.index.difference(measured.index)
+            classified.loc[old_measured_indexes, "_Class"] = "MEASURED_OLDER_DATE"
+        else:
+            measured = measured_all
+            errors.append(
+                {
+                    "Input Row": "",
+                    "Point Name": "",
+                    "Issue": f"No valid measured dates found in {latest_date_column}; latest-day filter was not applied.",
+                }
+            )
+    else:
+        measured = measured_all
+
     measured_keys = set(measured["_PointKey"])
     control_keys = set(controls["_PointKey"])
     unmatched = measured[~measured["_PointKey"].isin(control_keys)].copy()
@@ -199,7 +240,13 @@ def analyze_fieldbook(
         usable = candidates.dropna(subset=["_EastingNum", "_NorthingNum", "_HeightNum"])
 
         if usable.empty:
-            rows.append(_empty_result_row(control, "No valid measured observation matched this control point."))
+            rows.append(
+                _empty_result_row(
+                    control,
+                    "No valid measured observation matched this control point.",
+                    position_only=position_only,
+                )
+            )
             continue
 
         usable["_dE"] = usable["_EastingNum"] - control["_EastingNum"]
@@ -220,13 +267,19 @@ def analyze_fieldbook(
         height_pass = (
             nail_height_diff_mm is not None and abs(nail_height_diff_mm) <= height_tolerance_mm
         )
-        final_status = "OVERALL PASS" if position_pass and height_pass else "OVERALL FAIL"
+        final_status = (
+            "OVERALL PASS"
+            if (position_pass if position_only else position_pass and height_pass)
+            else "OVERALL FAIL"
+        )
 
         remarks = []
         if len(candidates) > 1:
             remarks.append(f"{len(candidates)} measured observations found.")
         if ground.name == nail.name:
             remarks.append("Same observation used for ground and nail checks.")
+        if position_only:
+            remarks.append("Positional settingout only; nail height status not used.")
 
         rows.append(
             {
@@ -247,7 +300,9 @@ def analyze_fieldbook(
                 "Nail Check Height": _coord(nail["_HeightNum"]),
                 "Nail Height Difference mm": nail_height_diff_mm,
                 "Nail Position Displacement mm": nail_disp_mm,
-                "Nail Height Status": _status(height_pass, "PASS HEIGHT", "FAIL HEIGHT"),
+                "Nail Height Status": (
+                    "NOT CHECKED" if position_only else _status(height_pass, "PASS HEIGHT", "FAIL HEIGHT")
+                ),
                 "Final Status": final_status,
                 "Remarks": " ".join(remarks),
             }
@@ -265,7 +320,14 @@ def analyze_fieldbook(
         | (report["Final Status"] == "OVERALL FAIL")
     ].copy()
 
-    summary = _build_summary(report, unmatched, position_tolerance_mm, height_tolerance_mm)
+    summary = _build_summary(
+        report,
+        unmatched,
+        position_tolerance_mm,
+        height_tolerance_mm,
+        latest_survey_date=latest_survey_date,
+        position_only=position_only,
+    )
 
     unmatched_out = unmatched.drop(columns=[col for col in unmatched.columns if col.startswith("_")], errors="ignore")
     unmatched_out["Classification"] = "UNMATCHED"
@@ -280,7 +342,7 @@ def analyze_fieldbook(
     }
 
 
-def _empty_result_row(control: pd.Series, remark: str) -> dict[str, Any]:
+def _empty_result_row(control: pd.Series, remark: str, position_only: bool = False) -> dict[str, Any]:
     row = {column: None for column in OUTPUT_COLUMNS}
     row.update(
         {
@@ -289,7 +351,7 @@ def _empty_result_row(control: pd.Series, remark: str) -> dict[str, Any]:
             "Control Northing": _coord(control["_NorthingReport"]),
             "Control Height": _coord(control["_HeightNum"]),
             "Ground Position Status": "FAIL POSITION",
-            "Nail Height Status": "FAIL HEIGHT",
+            "Nail Height Status": "NOT CHECKED" if position_only else "FAIL HEIGHT",
             "Final Status": "OVERALL FAIL",
             "Remarks": remark,
         }
@@ -302,6 +364,8 @@ def _build_summary(
     unmatched: pd.DataFrame,
     position_tolerance_mm: float,
     height_tolerance_mm: float,
+    latest_survey_date: Any = None,
+    position_only: bool = False,
 ) -> pd.DataFrame:
     total = len(report)
     position_pass = int((report["Ground Position Status"] == "PASS POSITION").sum()) if total else 0
@@ -311,20 +375,22 @@ def _build_summary(
     def pct(count: int) -> float:
         return round((count / total) * 100, 1) if total else 0.0
 
-    return pd.DataFrame(
-        [
+    rows = [
             {"Metric": "Total matched control points", "Value": total},
             {"Metric": "Total unmatched measured points", "Value": len(unmatched)},
+            {"Metric": "Comparison mode", "Value": "Positional settingout only" if position_only else "Position and height"},
+            {"Metric": "Latest survey date filter", "Value": latest_survey_date or "Not applied"},
             {"Metric": "Position tolerance mm", "Value": position_tolerance_mm},
             {"Metric": "Height tolerance mm", "Value": height_tolerance_mm},
             {"Metric": "Position pass count", "Value": position_pass},
             {"Metric": "Position pass percentage", "Value": pct(position_pass)},
-            {"Metric": "Height pass count", "Value": height_pass},
-            {"Metric": "Height pass percentage", "Value": pct(height_pass)},
             {"Metric": "Overall pass count", "Value": overall_pass},
             {"Metric": "Overall pass percentage", "Value": pct(overall_pass)},
         ]
-    )
+    if not position_only:
+        rows.insert(8, {"Metric": "Height pass count", "Value": height_pass})
+        rows.insert(9, {"Metric": "Height pass percentage", "Value": pct(height_pass)})
+    return pd.DataFrame(rows)
 
 
 def export_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
@@ -392,4 +458,3 @@ def _format_sheet(ws: Any, sheet_name: str) -> None:
     for column_cells in ws.columns:
         max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
         ws.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 12), 36)
-
