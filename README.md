@@ -21,11 +21,33 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
+To run the manhole setting-out report generator:
+
+```powershell
+streamlit run manhole_app.py
+```
+
 If you are using the bundled Codex runtime in this workspace, run:
 
 ```powershell
 C:\Users\User\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m streamlit run app.py
 ```
+
+For the manhole app with the bundled Codex runtime:
+
+```powershell
+C:\Users\User\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m streamlit run manhole_app.py
+```
+
+## Manhole setting-out app
+
+- Detects design manholes from `Solution = NONE` rows with valid coordinates and mostly zero observation metadata.
+- Lets you choose which design manholes to include.
+- Lets you define flow order by listing one manhole per line before plotting the layout and longsection.
+- Compares every surveyed/measured point to the nearest selected design manhole.
+- Exports branded Excel, PDF, and DXF reports.
+- Layout and DXF plotting use inverted coordinates (`plotted East = -East`, `plotted North = -North`) so negative field coordinates flip to the opposite sign for orientation.
+- Spreadsheet reports use 2 cm print margins and compact column widths for A4/A3 printing.
 
 ## Expected columns
 

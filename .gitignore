@@ -6,4 +6,8 @@ __pycache__/
 *.xlsm
 *.xls
 *.csv
+*.pdf
+*.dxf
+outputs/
+tmp/
 !sample_fieldbook.csv
